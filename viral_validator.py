@@ -23,13 +23,18 @@ class ViralScriptValidator:
         issues = []
         scores = {}
         
-        # 提取正文（去掉标题和标记）
-        text = re.sub(r'#.*\n', '', script)
-        text = re.sub(r'##.*\n', '', text)
-        word_count = len(text.replace(' ', '').replace('\n', ''))
+        rhythm_beats = self._extract_rhythm_beats(script)
+        target_duration_match = re.search(r'^duration_sec:\s*(\d+(?:\.\d+)?)\s*$', script, re.MULTILINE)
+        target_duration = float(target_duration_match.group(1)) if target_duration_match else None
+
+        # 只统计真正需要说出口的正文，排除 YAML、标题和制作标注。
+        text = self._spoken_text(script)
+        word_count = len(re.findall(r'[\u4e00-\u9fffA-Za-z0-9]', text))
         
         # 1. 黄金 3 秒钩子检查（v3.0 升级：张力度检测取代关键词匹配）
         hook_section = self._extract_section(script, '开场')
+        if not hook_section and rhythm_beats:
+            hook_section = rhythm_beats[0]['text']
         hook_score = 0
         if hook_section:
             # 1a. 数字张力 — 两个可比数字之间有显著差距（≥15%）或单数字+惊人词
@@ -159,28 +164,16 @@ class ViralScriptValidator:
             authenticity_score += 1
         if has_data:
             authenticity_score += 1
+
+        authenticity_score = min(authenticity_score, 3)
         
         if authenticity_score < 3:
             issues.append("缺少真实感（缺少具体客户名/数据/小区）")
         scores['真实感'] = authenticity_score
         
-        # 6. 节奏感检查
-        pacing_score = 0
-        has_hook = '## 开场' in script
-        has_conflict = '## 冲突' in script or '## 反差' in script or '## 痛点' in script
-        has_solution = '## 解决' in script or '## 专业' in script or '## 分析' in script
-        has_golden = '## 金句' in script
-        has_cta = '## 结尾' in script
-        
-        section_count = sum([has_hook, has_conflict, has_solution, has_golden, has_cta])
-        if section_count >= 4:
-            pacing_score = 3
-        elif section_count >= 3:
-            pacing_score = 2
-        elif section_count >= 2:
-            pacing_score = 1
-        else:
-            issues.append("节奏感不足（缺少明确的结构分段）")
+        # 6. 四维节奏检查：时间连续性、标注完整度、变化量各 1 分。
+        pacing_score, pacing_issues = self._score_rhythm(rhythm_beats, target_duration)
+        issues.extend(pacing_issues)
         scores['节奏感'] = pacing_score
         
         # 7. 互动钩子检查
@@ -257,11 +250,18 @@ class ViralScriptValidator:
             thesis_score = 1
         scores['中心思想明确性'] = thesis_score
 
-        # 长度验证
-        if word_count < 250:
-            issues.append(f"脚本太短（{word_count}字，建议300-500字）")
+        # 长度验证：有目标时长时按口播密度检查；旧脚本沿用宽松范围。
+        if target_duration:
+            min_chars = round(target_duration * 3.0)
+            max_chars = round(target_duration * 5.0)
+            if word_count < min_chars:
+                issues.append(f"口播密度偏低（{word_count}字/{target_duration:.0f}秒，建议约{min_chars}-{max_chars}字并以试读为准）")
+            elif word_count > max_chars:
+                issues.append(f"口播密度偏高（{word_count}字/{target_duration:.0f}秒，建议约{min_chars}-{max_chars}字并优先删旁支）")
+        elif word_count < 250:
+            issues.append(f"脚本太短（{word_count}字；建议先填写 duration_sec，再按时长检查）")
         elif word_count > 600:
-            issues.append(f"脚本太长（{word_count}字，建议300-500字）")
+            issues.append(f"脚本太长（{word_count}字；建议先填写 duration_sec，再按时长检查）")
         
         # 内部术语验证
         if "【" in script or "】" in script:
@@ -286,6 +286,133 @@ class ViralScriptValidator:
         pattern = rf'## {section_name}[^\n]*\n([^#]*?)(?=## |---|$)'
         match = re.search(pattern, script, re.DOTALL)
         return match.group(1).strip() if match else None
+
+    def _spoken_text(self, script):
+        """移除 YAML、标题和方括号制作标注，只保留口播正文。"""
+        text = script
+        if text.startswith('---'):
+            parts = text.split('---', 2)
+            text = parts[2] if len(parts) > 2 else text
+        text = re.sub(r'^#{1,6}.*$', '', text, flags=re.MULTILINE)
+        labels = (
+            '时间', '叙事动作', '情绪', '画面', '字幕叠加', '语速',
+            '停顿', '声音', '转场理由', '主强调', '章节标题'
+        )
+        for label in labels:
+            text = re.sub(rf'\[{label}:[^\]]*\]', '', text)
+        return text.strip()
+
+    def _extract_rhythm_beats(self, script):
+        """提取 `## 节奏拍` 区块和四维标注。"""
+        beats = []
+        blocks = re.split(r'(?m)^##\s+', script)
+        labels = ('时间', '叙事动作', '情绪', '画面', '语速', '停顿', '声音', '转场理由', '主强调')
+        for block in blocks:
+            lines = block.strip().splitlines()
+            if not lines or not lines[0].startswith('节奏拍'):
+                continue
+            body = '\n'.join(lines[1:])
+            annotations = {}
+            for label in labels:
+                match = re.search(rf'\[{label}:\s*([^\]]+)\]', body)
+                annotations[label] = match.group(1).strip() if match else None
+            beat_text = body
+            for label in labels + ('字幕叠加', '章节标题'):
+                beat_text = re.sub(rf'\[{label}:[^\]]*\]', '', beat_text)
+            beats.append({
+                'title': lines[0].strip(),
+                'annotations': annotations,
+                'time': self._parse_time_range(annotations['时间']),
+                'text': beat_text.strip(),
+            })
+        return beats
+
+    def _parse_time_range(self, value):
+        if not value:
+            return None
+        match = re.fullmatch(
+            r'\s*(\d{1,2}):(\d{2}(?:\.\d+)?)\s*[-–—]\s*(\d{1,2}):(\d{2}(?:\.\d+)?)\s*',
+            value,
+        )
+        if not match:
+            return None
+        start = int(match.group(1)) * 60 + float(match.group(2))
+        end = int(match.group(3)) * 60 + float(match.group(4))
+        return start, end
+
+    def _score_rhythm(self, beats, target_duration):
+        """按可拍时间轴评分，而不是按章节标题评分。"""
+        if not beats:
+            return 0, ["节奏感不足（缺少 `## 节奏拍` 时间轴，章节齐全不等于节奏成立）"]
+
+        score = 0
+        rhythm_issues = []
+        if target_duration is None:
+            rhythm_issues.append("缺少 duration_sec，无法核对节奏拍是否覆盖目标时长")
+
+        if target_duration is not None and target_duration <= 45:
+            min_beats = 4
+        elif target_duration is not None and target_duration <= 75:
+            min_beats = 6
+        elif target_duration is not None:
+            min_beats = 8
+        else:
+            min_beats = 6
+
+        parsed_times = [beat['time'] for beat in beats]
+        timing_ok = len(beats) >= min_beats and all(parsed_times)
+        if timing_ok:
+            if parsed_times[0][0] > 0.1:
+                timing_ok = False
+            for previous, current in zip(parsed_times, parsed_times[1:]):
+                gap = current[0] - previous[1]
+                if gap < -0.1 or gap > 1.0:
+                    timing_ok = False
+                    break
+            if any(end <= start or end - start > 12.0 for start, end in parsed_times):
+                timing_ok = False
+            if target_duration is not None and abs(parsed_times[-1][1] - target_duration) > 1.0:
+                timing_ok = False
+        if timing_ok:
+            score += 1
+        else:
+            rhythm_issues.append(
+                f"节奏时间轴不合格（当前{len(beats)}拍，需至少{min_beats}拍；检查时间码连续性、单拍≤12秒和目标时长覆盖）"
+            )
+
+        required = ('叙事动作', '情绪', '画面', '语速', '停顿', '声音', '转场理由', '主强调')
+        filled = sum(bool(beat['annotations'][label]) for beat in beats for label in required)
+        completeness = filled / (len(beats) * len(required))
+        emphasis_values = [beat['annotations']['主强调'] for beat in beats if beat['annotations']['主强调']]
+        emphasis_ok = all(value in {'台词', '画面', '字幕', '声音'} for value in emphasis_values)
+        if completeness >= 0.9 and emphasis_ok:
+            score += 1
+        else:
+            rhythm_issues.append(
+                f"四维节奏标注不完整或主强调无效（完整度{completeness:.0%}；主强调只能是台词/画面/字幕/声音）"
+            )
+
+        emotions = [beat['annotations']['情绪'] for beat in beats if beat['annotations']['情绪']]
+        visuals = [beat['annotations']['画面'] for beat in beats if beat['annotations']['画面']]
+        sounds = [beat['annotations']['声音'] for beat in beats if beat['annotations']['声音']]
+        speeds = [beat['annotations']['语速'] for beat in beats if beat['annotations']['语速']]
+        emotion_levels = [
+            tuple(int(n) for n in re.findall(r'[1-5]', emotion))
+            for emotion in emotions
+        ]
+        deltas = [levels[-1] - levels[0] for levels in emotion_levels if len(levels) >= 2]
+        has_emotion_curve = any(delta > 0 for delta in deltas) and any(delta < 0 for delta in deltas)
+        has_channel_variation = (
+            len(set(visuals)) >= 3
+            and len(set(sounds)) >= 3
+            and (len(set(speeds)) >= 2 or any('→' in speed for speed in speeds))
+        )
+        if has_emotion_curve and has_channel_variation:
+            score += 1
+        else:
+            rhythm_issues.append("节奏变化不足（需同时具备情绪上升与回落、至少3种画面状态、3种声音状态和2种表演速度）")
+
+        return score, rhythm_issues
     
     def print_report(self, validation):
         """打印验证报告"""
@@ -341,29 +468,40 @@ if __name__ == "__main__":
         # Test mode
         validator = ViralScriptValidator()
 
-        test_script = """# 1500.0买房，太太和老公意见不统一怎么办？
+        test_script = """---
+duration_sec: 60
+---
+# 1500万买房，夫妻意见不统一怎么办？
 
-## 开场（3秒钩子）
-今天遇到一对夫妻，为了一套房子吵得不可开交。为什么？
+## 节奏拍 01｜冲突
+[时间: 00:00-00:08] [叙事动作: 抛出预算与选择冲突] [情绪: 平静1→疑惑3]
+[画面: 夫妻看房背影] [语速: 快→正常] [停顿: 问句后0.4秒] [声音: 裸声] [转场理由: 用真实经历回答原因] [主强调: 台词]
+同样1500万预算，一套房太太坚决不要，老公却觉得错过可惜。问题到底出在哪？
 
-## 冲突描述（15秒）
-张越微信和太太来看房，预算1500.0，想在长宁买。
-本来以为是一件高兴的事，结果两个人意见完全不一致。
-太太觉得某个方面不太满意，但老公觉得价格合适。
-两个人看了好几套房子，就是定不下来。
+## 节奏拍 02｜人物
+[时间: 00:08-00:18] [叙事动作: 建立真实人物与分歧] [情绪: 疑惑3→焦虑4]
+[画面: 小区大门→人物中景] [语速: 正常] [停顿: 转折前0.5秒] [声音: BGM淡入] [转场理由: 从争执推进到选择标准] [主强调: 画面]
+张先生微信约我看长宁新城，夫妻俩本来觉得预算够了，结果太太担心采光，老公只盯着低了8%的价格。
 
-## 解决方案（20秒）
-我帮他们做了三件事：
-第一，列出了'必须满足'的清单。
-第二，列出了'可以妥协'的清单。
-第三，让他们各自选出最看重的3个点。
+## 节奏拍 03｜清单
+[时间: 00:18-00:28] [叙事动作: 给出第一步方法] [情绪: 焦虑4→理解3]
+[画面: 清单卡片] [语速: 稍快] [停顿: 列举间0.2秒] [声音: BGM稳定] [转场理由: 从方法转入隐藏代价] [主强调: 字幕]
+我建议先别争，我帮他们列三张清单：必须满足、可以妥协、绝对不能接受。这样讨论的就不是输赢，而是生活。
 
-## 金句（15秒）
-买房不是一个人的事，家庭意见统一比什么都重要。
-记住，房子是给人住的，不是用来吵架的。
+## 节奏拍 04｜反转
+[时间: 00:28-00:38] [叙事动作: 揭示低价背后的代价] [情绪: 放心2→警觉5]
+[画面: 窗景→户型图] [语速: 正常→慢] [停顿: “但”前0.6秒] [声音: BGM抽低] [转场理由: 用具体数据改变低价判断] [主强调: 台词]
+但真正的问题不是采光。那套房便宜120万，却要牺牲每天的通勤和孩子的活动空间，这才是长期成本。
 
-## 结尾（7秒）
-如果你也在长宁买房遇到家庭分歧，私信我，帮你分析。关注走起来"""
+## 节奏拍 05｜判断
+[时间: 00:38-00:50] [叙事动作: 完成认知反转并给判断] [情绪: 警觉5→确信4]
+[画面: 人物稳定近景] [语速: 慢→正常] [停顿: 核心句后0.9秒] [声音: 静音0.5秒→BGM恢复] [转场理由: 把判断落到可执行选择] [主强调: 台词]
+说白了，夫妻买房不是把两个人的偏好相加，而是先找出谁承担哪个代价。搞清楚这一点，选择反而简单。
+
+## 节奏拍 06｜收束
+[时间: 00:50-01:00] [叙事动作: 落地方法并发出经历型提问] [情绪: 确信4→回味2]
+[画面: 小区远景] [语速: 正常] [停顿: 问句后1秒] [声音: BGM淡出] [转场理由: 用观众经历完成互动] [主强调: 台词]
+第一看共同底线，第二算长期代价，第三再比较价格。你看房时也遇到过家人意见不一致吗？关注我，我继续帮你分析。"""
 
         result = validator.validate(test_script)
         validator.print_report(result)

@@ -32,8 +32,26 @@ from typing import Optional
 # 1. 脚本解析
 # ======================================================================
 
+def _annotation(body: str, label: str) -> Optional[str]:
+    """读取单个方括号标注。"""
+    match = re.search(rf'\[{re.escape(label)}:\s*([^\]]+)\]', body)
+    return match.group(1).strip() if match else None
+
+
+def _timecode_seconds(value: Optional[str]) -> Optional[tuple[float, float]]:
+    """把 00:03-01:12.5 转成秒数区间。"""
+    if not value:
+        return None
+    match = re.fullmatch(r'\s*(\d{1,2}):(\d{2}(?:\.\d+)?)\s*[-–—]\s*(\d{1,2}):(\d{2}(?:\.\d+)?)\s*', value)
+    if not match:
+        return None
+    start = int(match.group(1)) * 60 + float(match.group(2))
+    end = int(match.group(3)) * 60 + float(match.group(4))
+    return start, end
+
+
 def parse_script(script_path: str) -> list[dict]:
-    """解析 daily-script .md，提取每段的画面/字幕/语速标注。"""
+    """解析 daily-script，提取逐拍的叙事、情绪、画面和声音标注。"""
     with open(script_path, encoding='utf-8') as f:
         content = f.read()
 
@@ -52,15 +70,18 @@ def parse_script(script_path: str) -> list[dict]:
         if not body:
             continue
 
-        visual_match = re.search(r'\[画面:\s*([^\]]+)\]', body)
-        subtitle_match = re.search(r'\[字幕叠加:\s*([^\]]+)\]', body)
-        speed_match = re.search(r'\[语速:\s*([^\]]+)\]', body)
-        chapter_match = re.search(r'\[章节标题:\s*([^\]]+)\]', body)
+        annotations = {
+            label: _annotation(body, label)
+            for label in (
+                '时间', '叙事动作', '情绪', '画面', '字幕叠加', '语速',
+                '停顿', '声音', '转场理由', '主强调', '章节标题'
+            )
+        }
+        planned_range = _timecode_seconds(annotations['时间'])
 
-        text = re.sub(r'\[画面:[^\]]*\]', '', body)
-        text = re.sub(r'\[字幕叠加:[^\]]*\]', '', text)
-        text = re.sub(r'\[语速:[^\]]*\]', '', text)
-        text = re.sub(r'\[章节标题:[^\]]*\]', '', text)
+        text = body
+        for label in annotations:
+            text = re.sub(rf'\[{re.escape(label)}:[^\]]*\]', '', text)
         text = text.strip()
 
         if not text:
@@ -69,11 +90,20 @@ def parse_script(script_path: str) -> list[dict]:
         segments.append({
             'section': title,
             'text': text,
-            'visual': visual_match.group(1).strip() if visual_match else None,
-            'subtitle_overlay': subtitle_match.group(1).strip() if subtitle_match else None,
-            'speed': speed_match.group(1).strip() if speed_match else '正常',
-            'chapter_title': chapter_match.group(1).strip() if chapter_match else None,
-            'emphasis': title == '金句' or (subtitle_match is not None),
+            'timecode': annotations['时间'],
+            'planned_start': planned_range[0] if planned_range else None,
+            'planned_end': planned_range[1] if planned_range else None,
+            'narrative_action': annotations['叙事动作'],
+            'emotion': annotations['情绪'],
+            'visual': annotations['画面'],
+            'subtitle_overlay': annotations['字幕叠加'],
+            'speed': annotations['语速'] or '正常',
+            'pause': annotations['停顿'],
+            'sound': annotations['声音'],
+            'transition_reason': annotations['转场理由'],
+            'primary_emphasis': annotations['主强调'],
+            'chapter_title': annotations['章节标题'],
+            'emphasis': title == '金句' or (annotations['字幕叠加'] is not None),
         })
 
     return segments
@@ -660,8 +690,8 @@ def main():
             sys.exit(1)
         segments = parse_script(script_path)
         print('\n## 剪辑计划\n')
-        print('| 段 | 内容 | 操作 | 语速 | 字幕叠加 |')
-        print('|----|------|------|------|----------|')
+        print('| 拍 | 计划时间 | 叙事动作 | 情绪 | 画面 | 人声/停顿 | 声音 | 主强调 |')
+        print('|----|----------|----------|------|------|-----------|------|--------|')
         total_est = 0.0
         for seg in segments:
             char_count = len(seg['text'])
@@ -669,16 +699,13 @@ def main():
             sf = speed_factor(seg['speed'])
             dur = base_dur * sf if sf != 1.0 else base_dur
             total_est += dur
-            ops = []
-            if seg['emphasis']:
-                ops.append('画面放大110%')
-            if '慢' in seg['speed']:
-                ops.append('减速至85%')
-            elif '快' in seg['speed']:
-                ops.append('加速至118%')
-            ops_str = ', '.join(ops) if ops else '正常'
-            print(f'| {seg["section"]} | {seg["text"][:30]}... | {ops_str} | {seg["speed"]} | '
-                  f'{seg["subtitle_overlay"] or "无"} |')
+            planned = seg['timecode'] or '未标注'
+            performance = seg['speed']
+            if seg['pause']:
+                performance += f'；{seg["pause"]}'
+            print(f'| {seg["section"]} | {planned} | {seg["narrative_action"] or "未标注"} | '
+                  f'{seg["emotion"] or "未标注"} | {seg["visual"] or "未标注"} | '
+                  f'{performance} | {seg["sound"] or "未标注"} | {seg["primary_emphasis"] or "未标注"} |')
         print(f'\n预估成片时长: {total_est:.1f}s')
         return
 
